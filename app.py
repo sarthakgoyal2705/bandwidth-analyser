@@ -45,30 +45,55 @@ def process_pdf(file):
                         pass
             
             # Regex to match the data rows (User, Bandwidth, Requests, Browse Time)
-            # e.g., "Yadava, Miss Neell[00094091] 33,173,023,261 7,186 8:30:34"
-            row_pattern = re.compile(r"^(.*?)\s+([\d,]+)\s+([\d,]+)\s+(\d{1,3}:\d{2}:\d{2})$")
+            # This updated regex handles optional Requests and Time, and allows Time as MM:SS or H:MM:SS
+            row_pattern = re.compile(r"^(.*?)\s+([\d,]+)(?:\s+([\d,]+))?(?:\s+(\d{1,4}:\d{2}(?::\d{2})?))?$")
+            
+            page_extracted_data = []
+            pending_user_name = ""
             
             for line in text.split('\n'):
                 line = line.strip()
+                
+                # Ignore empty lines, headers, or totals
+                if not line or "Total:" in line or "User" in line or "Bandwidth" in line or "Date Range" in line or "Requests" in line:
+                    continue
+                
+                # If we have a pending user name from the previous line and this line looks like just numbers/time
+                if pending_user_name and re.match(r"^[\d,\s:]+$", line):
+                    line = pending_user_name + " " + line
+                    pending_user_name = ""
+                    
                 row_match = row_pattern.match(line)
                 if row_match:
                     user_val = row_match.group(1).strip()
                     bw_val = row_match.group(2).strip()
                     
-                    if "Total:" in user_val:
+                    if not user_val or user_val.lower() == 'user' or not re.search(r'[a-zA-Z]', user_val):
+                        # Invalid user name (e.g. it's just numbers), skip
                         continue
                         
                     bandwidth_kb = parse_bandwidth_str(bw_val)
                     
-                    extracted_data.append({
+                    page_extracted_data.append({
                         'Date': report_date,
                         'User': user_val,
                         'Bandwidth (KB)': bandwidth_kb,
                         'Source File': file.name
                     })
+                    pending_user_name = "" # Reset just in case
+                else:
+                    # If it didn't match, check if it's just text (a wrapped user name)
+                    if not re.search(r'\d', line) or (len(line) > 5 and not re.search(r'\s+[\d,]+\s+', line) and "Page" not in line):
+                        pending_user_name = line
+                    elif len(line) > 10 and not re.search(r"Page \d+", line):
+                        if 'unparsed' not in st.session_state:
+                            st.session_state.unparsed = []
+                        st.session_state.unparsed.append(f"[{file.name}] {line}")
+            
+            extracted_data.extend(page_extracted_data)
             
             # If regex didn't find anything on this page, try fallback to table extraction
-            if not extracted_data:
+            if not page_extracted_data:
                 tables = page.extract_tables()
                 for table in tables:
                     if not table or not table[0]:
@@ -118,6 +143,7 @@ st.sidebar.header("Data Management")
 if st.sidebar.button("🗑️ Clear / Reset Data"):
     st.session_state.parsed_files = set()
     st.session_state.all_data = []
+    st.session_state.unparsed = []
     st.session_state.uploader_key += 1
     st.rerun()
 
@@ -130,6 +156,8 @@ if uploaded_files is not None:
     if st.session_state.all_data:
         st.session_state.all_data = [row for row in st.session_state.all_data if row['Source File'] in current_file_names]
         st.session_state.parsed_files = st.session_state.parsed_files.intersection(current_file_names)
+    if 'unparsed' in st.session_state:
+        st.session_state.unparsed = [line for line in st.session_state.unparsed if any(f"[{f}]" in line for f in current_file_names)]
     
     # Parse new files
     new_files = [f for f in uploaded_files if f.name not in st.session_state.parsed_files]
@@ -264,3 +292,9 @@ else:
         
         with st.expander("Show Raw Extracted Data"):
             st.dataframe(filtered_df)
+            
+        if 'unparsed' in st.session_state and st.session_state.unparsed:
+            with st.expander("Show Skipped/Unparsed Lines (Debugging)"):
+                st.warning("The following lines from the PDFs were not parsed because they didn't match the expected format:")
+                for line in st.session_state.unparsed:
+                    st.text(line)
